@@ -68,3 +68,4 @@ spline_out.png
 logs
 outliers.txt
 **/.DS_Store
+**/.ipynb_checkpoints/**
