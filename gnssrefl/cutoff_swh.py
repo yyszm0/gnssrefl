@@ -22,24 +22,8 @@ import pywt
 import matplotlib.pyplot as plt
 
 
-# ---------- SNR66 読み込み ----------
-
-def load_snr66_single(path, snr_column="L1"):
-    """
-    1 つの SNR66 ファイルを読む。
-
-    列の想定:
-        0: sat
-        1: elevation [deg]
-        2: azimuth  [deg]
-        3: seconds-of-day
-        4: edot (未使用)
-        5: SNR S6 (未使用)
-        6: SNR L1 [dB-Hz]
-        7: SNR L2 [dB-Hz]
-        8: SNR L5 [dB-Hz]
-    """
-    path = Path(path)
+# ---------- SNR66 読み込み（単一/ディレクトリ共通） ----------
+def _read_snr_file(path: Path, snr_column: str = "L1") -> pd.DataFrame:
     if path.suffix == ".gz":
         with gzip.open(path, "rt") as f:
             data = np.loadtxt(f, comments="#")
@@ -49,7 +33,7 @@ def load_snr66_single(path, snr_column="L1"):
     sat = data[:, 0].astype(int)
     elev = data[:, 1]
     azim = data[:, 2]
-    sod = data[:, 3]      # 秒（0–86400）
+    sod  = data[:, 3]
     snr_L1 = data[:, 6]
     snr_L2 = data[:, 7]
     snr_L5 = data[:, 8]
@@ -75,29 +59,53 @@ def load_snr66_single(path, snr_column="L1"):
     return df
 
 
-def load_snr66_directory(base_dir, year, station, snr_column="L1"):
-    """
-    /etc/gnssrefl/refl_code/yyyy/snr/station/ 以下の .gz を全部読み込んで結合。
-    各ファイルに day_index を振る。
-    """
+def load_snr(
+    path_or_dir,
+    snr_column: str = "L1",
+    snr_type: str | None = None,   # "66", "88", "99" など
+) -> pd.DataFrame:
+    path = Path(path_or_dir)
+
+    if path.is_file():
+        df = _read_snr_file(path, snr_column=snr_column)
+        df["day_index"] = 0
+        return df
+
+    if path.is_dir():
+        # ★ ここが超重要
+        if snr_type is None:
+            pattern = "*.gz"
+        else:
+            pattern = f"*.snr{snr_type}.gz"
+
+        print(f"pattern = {pattern}")
+        files = sorted(path.glob(pattern))
+        if not files:
+            raise FileNotFoundError(f"No files matching {pattern} in {path}")
+
+        print("Reading snr files:")
+        df_list = []
+        for day_index, f in enumerate(files):
+            print(f"  {f}")
+            df_i = _read_snr_file(f, snr_column=snr_column)
+            df_i["day_index"] = day_index
+            df_list.append(df_i)
+        df_all = pd.concat(df_list, ignore_index=True)
+        return df_all
+
+    raise FileNotFoundError(f"{path} is neither a file nor a directory")
+
+
+def load_snr_station(
+    base_dir,
+    year,
+    station,
+    snr_column: str = "L1",
+    snr_type: str | None = None,
+) -> pd.DataFrame:
     base_dir = Path(base_dir)
     snr_dir = base_dir / str(year) / "snr" / station
-
-    print("Reading snr file:")
-    files = sorted(snr_dir.glob("*.gz"))
-    if not files:
-        raise FileNotFoundError(f"No .gz files in {snr_dir}")
-
-    df_list = []
-    for day_index, path in enumerate(files):
-        print(path)
-        df = load_snr66_single(path, snr_column=snr_column)
-        df["day_index"] = day_index
-        df_list.append(df)
-
-    df_all = pd.concat(df_list, ignore_index=True)
-    return df_all
-
+    return load_snr(snr_dir, snr_column=snr_column, snr_type=snr_type)
 
 # ---------- トラック分割 ----------
 
@@ -178,6 +186,7 @@ def _collect_pass_from_segment(segment, sat_id, day_index, e_min, e_max, min_poi
 
 # ---------- Wang の wavelet 部分（インデックス空間） ----------
 
+
 def preprocess_snr(e_deg, snr_db, poly_order=2):
     """
     1衛星パス分の SNR を x = sin(e) に並べ替え & トレンド除去。
@@ -198,6 +207,30 @@ def preprocess_snr(e_deg, snr_db, poly_order=2):
     return x_sorted, snr_detr, e_sorted_deg
 
 
+# ---------- Wavelet ヘルパー ----------
+
+
+def build_cmor_name(
+    wavelet_name: str | None = None,
+    bandwidth: float | None = None,
+    center_freq: float | None = None,
+    default_name: str = "cmor1.5-1.0",
+) -> str:
+    """
+    wavelet_name が指定されていればそれをそのまま返す。
+    None の場合は bandwidth, center_freq から "cmorB-C" を作る。
+    それも無ければ default_name を使う。
+    """
+    if wavelet_name is not None:
+        return wavelet_name
+
+    if bandwidth is not None and center_freq is not None:
+        # PyWavelets の cmor 命名規則に合わせる
+        return f"cmor{bandwidth}-{center_freq}"
+
+    return default_name
+
+
 def compute_wavelet_power_h_e(
     x,
     snr_detr,
@@ -205,18 +238,20 @@ def compute_wavelet_power_h_e(
     h_min=0.5,
     h_max=20.0,
     num_h=80,
-    wavelet_name="cmor1.5-1.0",
+    wavelet_name: str | None = None,
+    cmor_bandwidth: float | None = None,
+    cmor_center: float | None = None,
 ):
     """
     SNR(x) に CWT をかけて、(h, e) パワーマップ P(h, e) を作る（h は[m]）。
 
-    スケールは 2〜min(N/2, 256) を logspace で決める。
-    そこから f_x, h を逆算する。
+    wavelet_name を直接指定するか、
+    cmor_bandwidth, cmor_center から "cmorB-C" を構成する。
     """
     x = np.asarray(x)
     snr_detr = np.asarray(snr_detr)
 
-    dx = np.mean(np.diff(x))        # x = sin(e) の刻み
+    dx = np.mean(np.diff(x))  # x = sin(e) の刻み
     N = len(x)
 
     # スケールを計算しやすい範囲に制限
@@ -226,6 +261,14 @@ def compute_wavelet_power_h_e(
         s_max = s_min + 1.0
 
     scales = np.logspace(np.log10(s_min), np.log10(s_max), num_h)
+
+    # wavelet 名を決定
+    wavelet_name = build_cmor_name(
+        wavelet_name=wavelet_name,
+        bandwidth=cmor_bandwidth,
+        center_freq=cmor_center,
+        default_name="cmor1.5-1.0",
+    )
 
     wavelet = pywt.ContinuousWavelet(wavelet_name)
     center_freq = pywt.central_frequency(wavelet)
@@ -263,32 +306,19 @@ def extract_h_peak_per_e(h_grid, power):
     h_peak = h_grid[peak_idx]
     return h_peak
 
+
 def compute_coh_inco_power_per_e(
     h_grid,
     power,
     rh_ref,
-    coh_half_width=2.0,   # RH_ref ± 2 m を coherent 帯
-    inco_gap=4.0,         # RH_ref - 4 m 以下を incoherent 帯
+    coh_half_width=2.0,  # RH_ref ± 2 m を coherent 帯
+    inco_gap=4.0,  # RH_ref - 4 m 以下を incoherent 帯
 ):
     """
     各仰角 e ごとに、
         - coherent 帯 (rh_ref ± coh_half_width) のパワー
         - incoherent 帯 (h <= rh_ref - inco_gap) のパワー
     を求める。
-
-    Parameters
-    ----------
-    h_grid : 1D array
-        反射高 [m] のグリッド
-    power : 2D array (nh, ne)
-        wavelet パワー |W|^2
-    rh_ref : float
-        期待される RH [m]（既知ならその値、なければ高仰角から推定）
-
-    Returns
-    -------
-    power_coh, power_inco : 1D array (ne,)
-        各仰角列ごとのパワー
     """
     h = np.asarray(h_grid)
 
@@ -314,26 +344,15 @@ def compute_coh_inco_power_per_e(
 
     return power_coh, power_inco
 
+
 def estimate_cutoff_from_h_peak_step(
     e_deg_sorted,
     h_peak,
-    h_high=9.0,   # 「RHが9m以上」の閾値
-    h_low=5.0,    # 「5m未満」の閾値
+    h_high=9.0,  # 「RHが9m以上」の閾値
+    h_low=5.0,  # 「5m未満」の閾値
 ):
     """
     h_peak(e) から e_cutoff_lower / e_cutoff_upper を決める単純なロジック。
-
-    - h_peak >= h_high → 状態 'H'
-    - h_peak <= h_low  → 状態 'L'
-    - それ以外        → 状態 'M'（判定には使わない）
-
-    e を昇順に見ていき、連続点 i-1, i で
-        (H → L) または (L → H)
-    となる i を「cutoff候補」とする。
-
-    cutoff候補のうち:
-        最小の e  → e_cutoff_lower
-        最大の e  → e_cutoff_upper
     """
     e = np.asarray(e_deg_sorted)
     h = np.asarray(h_peak)
@@ -343,11 +362,11 @@ def estimate_cutoff_from_h_peak_step(
 
     state = np.full(len(e), "M", dtype="<U1")
     state[h >= h_high] = "H"
-    state[h <= h_low]  = "L"
+    state[h <= h_low] = "L"
 
     cut_idxs = []
     for i in range(1, len(e)):
-        s0, s1 = state[i-1], state[i]
+        s0, s1 = state[i - 1], state[i]
         if (s0 == "H" and s1 == "L") or (s0 == "L" and s1 == "H"):
             cut_idxs.append(i)
 
@@ -360,6 +379,7 @@ def estimate_cutoff_from_h_peak_step(
     e_cutoff_upper = float(e[i_max])
 
     return e_cutoff_lower, e_cutoff_upper
+
 
 def estimate_cutoff_from_power(
     e_deg_sorted,
@@ -374,14 +394,6 @@ def estimate_cutoff_from_power(
 ):
     """
     2次元パワーから e_cutoff_lower, e_cutoff_upper を判定する。
-
-    - まず RH_ref を決める：
-        rh_input が与えられていればそれを使う。
-        None のときは、高仰角側 (上位 high_frac) の h_peak から推定。
-    - 各 e ごとに coherent/incoherent 帯のパワー (Pc, Pi) を計算。
-    - Pi/Pc >= ratio_thresh となる e の“連続区間”を探す。
-        その最小仰角 → e_cutoff_lower
-             最大仰角 → e_cutoff_upper
     """
     e = np.asarray(e_deg_sorted)
 
@@ -449,9 +461,6 @@ def estimate_cutoff_from_power(
 def bin_h_peak_in_elevation(e_deg_sorted, h_peak, bin_width_deg=1.0, min_count=3):
     """
     仰角 e_deg_sorted に対する h_peak を、bin_width_deg ごとにビン平均する。
-
-    - 各ビン内で e, h_peak の平均を取る
-    - サンプル数が min_count 未満のビンは捨てる
     """
     e = np.asarray(e_deg_sorted)
     h = np.asarray(h_peak)
@@ -476,12 +485,13 @@ def bin_h_peak_in_elevation(e_deg_sorted, h_peak, bin_width_deg=1.0, min_count=3
 
     return np.array(e_coarse), np.array(h_coarse)
 
+
 def estimate_cutoff_coh_inco_adaptive(
     e_deg_sorted,
     h_peak,
-    high_frac=0.3,      # 高仰角側の割合
-    coh_half_width=2.0, # coherent 帯の ±幅[m]
-    inco_gap=4.0,       # RH_ref からこれだけ低いところを incoherent 帯に
+    high_frac=0.3,  # 高仰角側の割合
+    coh_half_width=2.0,  # coherent 帯の ±幅[m]
+    inco_gap=4.0,  # RH_ref からこれだけ低いところを incoherent 帯に
     min_run_len=2,
 ):
     e = np.asarray(e_deg_sorted)
@@ -502,31 +512,31 @@ def estimate_cutoff_coh_inco_adaptive(
     h_coh_max = rh_ref + coh_half_width
     h_inco_max = rh_ref - inco_gap
 
-    coh_mask  = (h >= h_coh_min) & (h <= h_coh_max)
-    inco_mask = (h <= h_inco_max)
+    coh_mask = (h >= h_coh_min) & (h <= h_coh_max)
+    inco_mask = h <= h_inco_max
 
     state = np.full(len(e), "N", dtype="<U1")
-    state[coh_mask]  = "C"
+    state[coh_mask] = "C"
     state[inco_mask] = "I"
 
     def find_transition(prev_state, next_state):
         idxs = []
         for i in range(1, len(e)):
-            if state[i-1] == prev_state and state[i] == next_state:
+            if state[i - 1] == prev_state and state[i] == next_state:
                 idxs.append(i)
         if not idxs:
             return None
         # 連続区間チェック
         runs = []
         start = idxs[0]
-        prev  = idxs[0]
+        prev = idxs[0]
         for k in idxs[1:]:
             if k == prev + 1:
                 prev = k
             else:
                 runs.append((start, prev))
                 start = k
-                prev  = k
+                prev = k
         runs.append((start, prev))
         for s, t in runs:
             if (t - s + 1) >= min_run_len:
@@ -551,12 +561,6 @@ def estimate_cutoff_angles_from_h_peak_index(
 ):
     """
     h_peak_index(e) から e_cutoff_lower / e_cutoff_upper を推定（改訂版）。
-
-    - 高仰角側 (上位 high_frac) の median を「RH レベル」とみなす
-    - h_peak_index が rh_level より jump_thresh_index 以上「低い」点を bad とする
-      （= RH 付近の ridge から下に飛んだ点）
-    - bad が連続している区間のうち、最も長いものを「cutoff 領域」とみなす
-    - その区間の e の最小値 / 最大値を e_cutoff_lower / e_cutoff_upper とする
     """
     e = np.asarray(e_deg_sorted)
     h_idx = np.asarray(h_peak_index)
@@ -595,7 +599,7 @@ def estimate_cutoff_angles_from_h_peak_index(
             prev = k
     runs.append((start, prev))
 
-    # 一番長い区間を採用（必要なら「平均 diff_down が最大の区間」にしてもよい）
+    # 一番長い区間を採用
     best_run = max(runs, key=lambda ab: ab[1] - ab[0] + 1)
 
     if best_run[1] - best_run[0] + 1 < min_run_length:
@@ -610,23 +614,16 @@ def estimate_cutoff_angles_from_h_peak_index(
 
     return e_cutoff_lower, e_cutoff_upper, rh_level
 
+
 def estimate_cutoff_angles_from_h_peak(
     e_deg_sorted,
     h_peak,
-    rh_input=None,      # 入力RHがあればここに[m]で渡せる
-    high_frac=0.3,      # 自動推定する場合: 上位30%の仰角からRHを推定
-    threshold_m=6.0,    # 「RH±3 m」ルール
+    rh_input=None,  # 入力RHがあればここに[m]で渡せる
+    high_frac=0.3,  # 自動推定する場合: 上位30%の仰角からRHを推定
+    threshold_m=6.0,  # 「RH±3 m」ルール
 ):
     """
     h_peak(e)[m] から e_cutoff_lower / e_cutoff_upper を推定。
-
-    - RH を決める：
-        rh_input が与えられていればそれを使用。
-        None のときは、高仰角側 (上位 high_frac) の h_peak の median を RH とみなす。
-    - |h_peak - RH| <= threshold_m なら「coherent 領域」。
-      それを外れた e を「cut-off 領域」とみなす。
-    - cut-off 領域に属する e の最小値 / 最大値が
-        e_cutoff_lower / e_cutoff_upper。
     """
     e = np.asarray(e_deg_sorted)
     h = np.asarray(h_peak)
@@ -666,10 +663,17 @@ def process_single_pass(
     h_min=0.5,
     h_max=20.0,
     num_h=80,
-    wavelet_name="cmor1.5-1.0",
+    wavelet_name: str | None = "cmor9.0-1.0",
+    cmor_bandwidth: float | None = None,
+    cmor_center: float | None = None,
     plot=False,
-    rh_input=None,   # 使うなら別途
+    rh_input=None,  # 使うなら別途
+    e_plot_range=None,   # 追加 (例: (5.0, 40.0))
 ):
+    """
+    1パス分のデータに対して wavelet 解析を実行し、
+    h_peak(e) と cut-off などを求める。
+    """
     # 1) 前処理
     x, snr_detr, e_sorted = preprocess_snr(e_deg, snr_db)
 
@@ -682,6 +686,8 @@ def process_single_pass(
         h_max=h_max,
         num_h=num_h,
         wavelet_name=wavelet_name,
+        cmor_bandwidth=cmor_bandwidth,
+        cmor_center=cmor_center,
     )
 
     # 3) h_peak(e)
@@ -712,9 +718,10 @@ def process_single_pass(
         plt.pcolormesh(e_sorted, h_grid, power, shading="auto")
         plt.xlabel("Elevation [deg]")
         plt.ylabel("Reflector height h [m]")
-        plt.title("Wavelet power |W|^2")
+        plt.title(f"Wavelet power |W|^2 ({wavelet_name})")
         plt.colorbar(label="Power")
         plt.axhline(rh_ref, color="w", linestyle="--", label="RH")
+        plt.xlim(5.0, 40.0)          # ★ ここで Elevation のレンジを固定
         plt.legend()
         plt.show()
 
@@ -722,13 +729,14 @@ def process_single_pass(
         plt.figure()
         plt.plot(e_sorted, h_peak, ".", label="h_peak(e)")
         plt.axhline(9.0, color="k", linestyle="--", label="9 m")
-        plt.axhline(5.0, color="k", linestyle=":",  label="5 m")
+        plt.axhline(5.0, color="k", linestyle=":", label="5 m")
         if e_cut_low is not None:
             plt.axvline(e_cut_low, color="r", linestyle="--", label="e_cutoff_lower")
         if e_cut_up is not None:
             plt.axvline(e_cut_up, color="g", linestyle="--", label="e_cutoff_upper")
         plt.xlabel("Elevation [deg]")
         plt.ylabel("h_peak [m]")
+        plt.xlim(5.0, 40.0)          # ★ こっちの図にも同じように
         plt.legend()
         plt.title("h_peak(e) and cutoff (9m ↔ 5m rule)")
         plt.show()
@@ -743,7 +751,9 @@ def process_single_pass(
         "rh_ref": rh_ref,
     }
 
+
 # ---------- SWH 推定 & ステーション全体実行 ----------
+
 
 def estimate_swh_for_pass(
     e_cutoff_upper_deg,
@@ -780,7 +790,12 @@ def process_station_for_swh(
     rh_level=None,
     output_csv="swh_estimates.csv",
     debug=False,
-    use_binning=False,
+    use_binning=False,  # まだ未使用だがインターフェース維持
+    # wavelet 関連
+    wavelet_name: str | None = None,
+    cmor_bandwidth: float | None = None,
+    cmor_center: float | None = None,
+    snr_type: str | None = None,   # 例: "66", "88", "99"
 ):
     """
     /etc/gnssrefl/refl_code/yyyy/snr/station/ 以下の snr66(.gz) をすべて読み込み、
@@ -788,15 +803,16 @@ def process_station_for_swh(
     """
     t_all0 = time.perf_counter()
 
-    df_snr = load_snr66_directory(
+    df_snr = load_snr_station(
         base_dir=base_dir,
         year=year,
         station=station,
         snr_column=snr_column,
+        snr_type=snr_type,
     )
     t1 = time.perf_counter()
     if debug:
-        print(f"load_snr66_directory: {len(df_snr)} rows, took {t1 - t_all0:.3f} s")
+        print(f"load_snr66_station: {len(df_snr)} rows, took {t1 - t_all0:.3f} s")
 
     passes = split_into_passes(
         df_snr,
@@ -820,7 +836,9 @@ def process_station_for_swh(
             h_min=h_min,
             h_max=h_max,
             num_h=num_h,
-            wavelet_name="cmor1.5-1.0",
+            wavelet_name=wavelet_name,
+            cmor_bandwidth=cmor_bandwidth,
+            cmor_center=cmor_center,
             plot=False,
             rh_input=rh_level,
         )
@@ -855,7 +873,6 @@ def process_station_for_swh(
                 "swh_m": swh,
             }
         )
-
 
     df_out = pd.DataFrame(records)
     df_out.to_csv(output_csv, index=False)

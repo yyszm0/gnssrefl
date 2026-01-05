@@ -80,6 +80,8 @@ def plot_wind_polar(
     show=True,              # True なら plt.show()
     az_mask=None,           # 例: [(0,180)] とか [(200,260),(280,320)]
     r_max_fixed=45.0,       # 衛星仰角のlimを固定したいのでデフォルト45°
+    enable_ellipse=True,    # ★ 楕円フィット描画をするか
+    enable_direction=True,  # ★ 風向の推定＋矢印を出すか
 ):
     """
     Wang 図っぽい極座標図を描く。
@@ -98,7 +100,10 @@ def plot_wind_polar(
         raise ValueError("No data left after azimuth mask")
 
     # 風向（mask 後のデータで推定）
-    wind_dir_deg = estimate_wind_direction_from_cutoff_lower(df)
+    if enable_direction:
+        wind_dir_deg = estimate_wind_direction_from_cutoff_lower(df)
+    else:
+        wind_dir_deg = None
     theta_wind = np.deg2rad(wind_dir_deg) if wind_dir_deg is not None else None
 
     fig = plt.figure(figsize=(6, 6))
@@ -113,7 +118,11 @@ def plot_wind_polar(
     ax.scatter(theta, r, marker="s", color="k", label="Cutoff lower")
 
     # 楕円っぽい曲線（mask 後の df を使う）
-    theta_fit, r_fit = fit_ellipse_like_curve(df)
+    if enable_ellipse:
+        theta_fit, r_fit = fit_ellipse_like_curve(df)
+    else:
+        theta_fit, r_fit = None, None
+
     if theta_fit is not None:
         ax.plot(theta_fit, r_fit, color="red", linewidth=2.0, label="Fitted curve")
         idx_max = np.argmax(r_fit)
@@ -130,7 +139,10 @@ def plot_wind_polar(
     if r_max_fixed is not None:
         r_lim_max = r_max_fixed
     else:
-        r_lim_max = max(np.max(r), np.max(r_fit) if r_fit is not None else 0) * 1.1
+        r_lim_max = max(
+            np.max(r),
+            np.max(r_fit) if r_fit is not None else 0
+        ) * 1.1
 
     # 風向ベクトル
     if theta_wind is not None:
